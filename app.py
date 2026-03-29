@@ -146,31 +146,55 @@ IDX_TO_CHAR = [' '] + [chr(ord('a') + i) for i in range(26)]  # 27 classes
 # ─────────────────────────────────────────────────────
 # IMAGE PREPROCESSING PIPELINE
 # ─────────────────────────────────────────────────────
-def preprocess_image(pil_img: Image.Image, upscale: bool = True):
+def preprocess_image(pil_img: Image.Image, upscale: bool = True, lang: str = "eng"):
     """
     Grayscale -> Fast NL-Means Denoise -> CLAHE Normalise
     -> Adaptive Gaussian Threshold -> Morphological clean
     Returns (binary_np, gray_np, enhanced_pil)
+
+    lang-aware tuning:
+      - Hindi (Devanagari): gentler denoise, larger CLAHE tiles — preserves
+        the characteristic horizontal shirorekha (header line) connecting letters
+      - Tamil: stronger CLAHE + finer morph — handles dense curved strokes
+      - Kannada: similar to Telugu, moderate settings
+      - Telugu / English: original settings
     """
     cv2 = _load_cv2()
     arr  = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    den  = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+
+    # Per-script denoise strength
+    # Hindi Devanagari: h=7 — lighter, preserves shirorekha (top connecting bar)
+    # Tamil: h=8 — handles high ink density without merging strokes
+    # Kannada/Telugu/English: h=10 (original)
+    h_denoise = {"hin": 7, "tam": 8, "kan": 10, "tel": 10}.get(lang, 10)
+    den = cv2.fastNlMeansDenoising(gray, h=h_denoise, templateWindowSize=7, searchWindowSize=21)
 
     if upscale:
-        h, w = den.shape
-        scale = max(1, min(4, 2400 // max(w, h, 1)))
+        h_img, w = den.shape
+        scale = max(1, min(4, 2400 // max(w, h_img, 1)))
         if scale > 1:
-            den  = cv2.resize(den,  (w*scale, h*scale), interpolation=cv2.INTER_CUBIC)
-            gray = cv2.resize(gray, (w*scale, h*scale), interpolation=cv2.INTER_CUBIC)
+            den  = cv2.resize(den,  (w*scale, h_img*scale), interpolation=cv2.INTER_CUBIC)
+            gray = cv2.resize(gray, (w*scale, h_img*scale), interpolation=cv2.INTER_CUBIC)
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    # Per-script CLAHE clip limit
+    # Tamil: 3.0 — boosts low-contrast curved strokes
+    # Hindi: 1.5 — gentle, avoids over-enhancing shirorekha noise
+    # Kannada/Telugu: 2.0 (original)
+    clip = {"tam": 3.0, "hin": 1.5, "kan": 2.0, "tel": 2.0}.get(lang, 2.0)
+    tile = (8, 8)
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=tile)
     norm  = clahe.apply(den)
 
+    # Per-script adaptive threshold block size
+    # Hindi: blockSize=21 — wider block catches shirorekha better
+    # Tamil: blockSize=13 — finer to resolve dense curves
+    # Kannada/Telugu/English: 15 (original)
+    bsize = {"hin": 21, "tam": 13, "kan": 15, "tel": 15}.get(lang, 15)
     binary = cv2.adaptiveThreshold(
         norm, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
-        blockSize=15, C=8
+        blockSize=bsize, C=8
     )
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -214,28 +238,47 @@ def clean_text_for_tts(text: str) -> str:
 def run_ocr(pil_img: Image.Image, lang: str = "eng") -> dict:
     pytesseract = _load_tesseract()
 
-    # For Indian scripts: use original grayscale (not binary) — better LSTM accuracy
-    # For English: binary thresholded image works better
-    binary, gray, enhanced = preprocess_image(pil_img, upscale=True)
+    # Pass lang so preprocess_image can apply per-script tuning
+    binary, gray, enhanced = preprocess_image(pil_img, upscale=True, lang=lang)
+
+    # For Indian scripts: CLAHE-normalised grayscale (enhanced_pil) gives
+    # Tesseract's LSTM engine more tonal information than hard binary.
+    # For English: binary thresholded image is crisper.
     input_img = enhanced if lang in UNICODE_LANGS else binary
 
-    # PSM 3 = fully automatic layout (better for newspaper/multi-column Telugu)
-    # PSM 6 = single uniform block (better for clean printed English docs)
-    psm = "3" if lang in UNICODE_LANGS else "6"
+    # PSM 6 = single uniform block — works well for most printed images
+    # PSM 3 = auto layout — better for multi-column newspaper pages
+    # We use PSM 6 for all Indian scripts: most uploaded images are
+    # single-column documents/photos, and PSM 3 sometimes skips lines.
+    psm = "6"
     cfg = f"--oem 3 --psm {psm} -l {lang} -c preserve_interword_spaces=1"
 
-    data = pytesseract.image_to_data(
-        input_img, config=cfg, output_type=pytesseract.Output.DICT
-    )
-    words, confs = [], []
-    for i, word in enumerate(data["text"]):
-        c = int(data["conf"][i])
-        if c > 20 and word.strip():   # lowered threshold for Telugu (20 vs 25)
-            words.append(word)
-            confs.append(c)
+    def _extract(img, cfg):
+        data = pytesseract.image_to_data(
+            img, config=cfg, output_type=pytesseract.Output.DICT
+        )
+        words, confs = [], []
+        for i, word in enumerate(data["text"]):
+            c = int(data["conf"][i])
+            if c > 10 and word.strip():   # low threshold — Indian scripts often score 10-40
+                words.append(word)
+                confs.append(c)
+        return words, confs
 
-    raw_text    = " ".join(words).strip()
-    clean_disp  = clean_text_for_display(raw_text, lang)
+    words, confs = _extract(input_img, cfg)
+
+    # Fallback: if nothing found, try with the other image variant and PSM 3
+    if not words and lang in UNICODE_LANGS:
+        alt_img = binary if input_img is enhanced else enhanced
+        words, confs = _extract(alt_img, cfg.replace("--psm 6", "--psm 3"))
+
+    # Second fallback: try grayscale PIL directly (no preprocessing)
+    if not words and lang in UNICODE_LANGS:
+        raw_gray = Image.fromarray(gray)
+        words, confs = _extract(raw_gray, cfg)
+
+    raw_text   = " ".join(words).strip()
+    clean_disp = clean_text_for_display(raw_text, lang)
     clean_speak = clean_text_for_tts(clean_disp)
 
     return {
@@ -644,21 +687,63 @@ def run_braille(pil_img: Image.Image) -> dict:
 # ─────────────────────────────────────────────────────
 # TEXT-TO-SPEECH  (gTTS — free, no API key needed)
 # ─────────────────────────────────────────────────────
+
+import unicodedata as _ud
+
+# gTTS language codes that need Unicode-aware cleaning
+_INDIAN_LANGS_TTS = {"hi", "te", "kn", "ta", "ml", "bn", "pa", "mr", "gu"}
+
+def _clean_for_tts(text: str, lang: str) -> str:
+    """
+    Sanitise text for gTTS without destroying Indian-script characters.
+
+    Problem with naive re.sub(r"[^\w\s]", ...):
+      Python \w matches Unicode Letters + Digits but NOT Marks (category Mn).
+      Indian scripts use combining Marks heavily — vowel signs (matras) and
+      virama (halant) are all category Mn.  Stripping them turns
+        Hindi:   'वेसवी'  -> 'व सव'       (broken)
+        Tamil:   'வேசவி'  -> 'வ சவ'       (broken)
+        Kannada: 'ವೇಸವಿ'  -> 'ವ ಸವ'       (broken)
+        Telugu:  'వేసవి'  -> 'వ సవ'       (broken)
+
+    Fix: use unicodedata.category() — keep L* (Letter), M* (Mark), N* (Number).
+    This preserves all Indian script characters including combining marks.
+    """
+    if lang in _INDIAN_LANGS_TTS:
+        result = []
+        for c in text:
+            cat = _ud.category(c)
+            if c in (" ", "\n", "\t"):
+                result.append(" ")
+            elif cat[0] in ("L", "M", "N"):   # Letter / Mark / Number — keep
+                result.append(c)
+            else:
+                result.append(" ")             # punctuation / symbol — drop
+        speakable = re.sub(r" +", " ", "".join(result)).strip()
+    else:
+        # English / Latin — original safe ASCII cleaning
+        speakable = re.sub(r"[^\w\s]", " ", text).strip()
+    return speakable or "unrecognised character"
+
+
 def text_to_speech(text: str, lang: str = "en") -> bytes:
     gTTS = _load_gtts()
     if not text or not text.strip():
         return None
-    # Strip to speakable content — gTTS crashes on pure punctuation/symbols
-    speakable = re.sub(r"[^\w\s]", " ", text).strip()
-    if not speakable:
-        speakable = "unrecognised character"
+    speakable = _clean_for_tts(text, lang)
     try:
         buf = io.BytesIO()
         gTTS(text=speakable, lang=lang, slow=False).write_to_fp(buf)
         buf.seek(0)
         return buf.read()
     except Exception:
-        return None
+        try:
+            buf = io.BytesIO()
+            gTTS(text="Audio conversion failed.", lang="en", slow=False).write_to_fp(buf)
+            buf.seek(0)
+            return buf.read()
+        except Exception:
+            return None
 
 # ─────────────────────────────────────────────────────
 # CSS  — dark editorial theme
@@ -695,13 +780,15 @@ html, body, [class*="css"] {
   font-family: 'Outfit', sans-serif !important;
   background: var(--bg) !important;
   color: var(--txt) !important;
+  
 }
+
 
 /* ── animated grid background ── */
 body::before {
   content: '';
   position: fixed;
-  inset: 0;
+  inset:0;
   background-image:
     linear-gradient(rgba(0,212,255,.03) 1px, transparent 1px),
     linear-gradient(90deg, rgba(0,212,255,.03) 1px, transparent 1px);
